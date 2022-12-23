@@ -1,25 +1,51 @@
 import os
-import sys
 import copy
-import time
 import argparse
 import pathlib
-
-
+import datetime
+import logging
 
 import ee
 import requests
 import configparser
 import rasterio as rio
-import geopandas as gpd
 import pandas as pd
-from affine import Affine
-from shapely.geometry import Polygon
+import geopandas as gpd
 import google.auth
 from google.auth.transport.requests import Request
 from google.cloud import storage
 
-DEF_PATH = '/media/nsteiner/data1/sen12ms/ROIs1868_summer_s1'
+from shapely.geometry import Polygon
+from affine import Affine
+
+# Constants
+DEF_PATH = '/media/nsteiner/data1/sen12ms/ROIs1970_fall_s1'
+
+# Set the log file name and location
+_log_file = 'eelc.log'
+_log_file_path = pathlib.Path(__file__).parent / _log_file
+try:
+    assert _log_file_path.exists()
+except:
+    open(_log_file_path, 'w').write('EELC LOGFILE\n')
+
+logging.basicConfig(filename=_log_file_path.as_posix(), filemode='a', level='INFO', format='%(message)s')
+
+
+
+def print_with_logging(message, log_level=logging.INFO):
+    """Prints a message to the console and logs it to a file.
+
+    Parameters:
+        message (str): The message to print and log.
+        log_level (int): The log level of the message. Default is logging.INFO.
+    """
+    # Print the message to the console
+    print(message)
+    # Configure the logging module to log messages to the log file
+
+    # Log the message to a file
+    logging.log(log_level, message)
 
 
 def load_configs():
@@ -31,7 +57,7 @@ def load_configs():
         raise Exception('NASA Earthdata credentials not found, please run: write_earthdata_credentials.py')
     return dict(config_parser['gcs'])
 
-
+# Initialize Earth Engine credentials
 def init_credentials():
     config = load_configs()
     service_account = config['service_account']
@@ -39,7 +65,7 @@ def init_credentials():
     ee.Initialize(credentials)
     os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = config['private_key']
 
-
+# Extract metadata from TIF file name
 def parse_tif(file_path):
     # Get the file name
     #
@@ -139,26 +165,13 @@ def get_current_files():
     # Print the file names
     return [f.name for f in files]
 
-def main():
+def write_poly_chips(poly_list):
     
-    init_credentials()
     config = load_configs()
-
-    # Create a list of tasks
-    # get a list of patch polygons from the dataset
-    tif_path = pathlib.Path(args.path) 
-    try:
-        poly_list = gpd.read_file(f'{tif_path.name}.shp')
-    except:
-        poly_list = get_poly_list(tif_path)
-        poly_list.to_file(f'{tif_path.name}.shp', driver='ESRI Shapefile')
-    
-    def get_file_prefix(row):
-        return f"lc_glob_2017_{row['roi']}_{row['scene']}_{row['patch']}"
-    poly_list['file_prefix']  = poly_list.apply(get_file_prefix, axis=1)
 
     # get blob_list
     current_files = get_current_files()
+    # mask files already in bucket
     mask = poly_list['file_prefix'].isin([c.replace('.tif', '') for c in current_files])
     poly_list = poly_list[~mask]
 
@@ -168,8 +181,12 @@ def main():
     
     # set export tasks
     tasks = []
+    task_ct = 0
+    dry_run = 20
+
     # Iterate over the list of tasks
-    for  i, patch_ in poly_list.iterrows():
+    for  _, patch_ in poly_list.iterrows():
+
         # Set the parameters for the export task
         ee_poly = ee.Geometry.Polygon(list(patch_.geometry.exterior.coords))
         task_params = {
@@ -185,45 +202,93 @@ def main():
         
         # Add the task to the list of tasks
         tasks.append(export_task)
+        task_ct += 1 # this counter only for the dry-run
+        if args.test:
+           if task_ct > dry_run:
+                break 
 
-    # Iterate over the list of tasks to start
-    dry_run = 4
-    ct_, ct_done = 0, 0
+
+
+    # Initialize variables
+    ct_start, ct_done = 0, 0
     max_tasks = 2000
-    batch_tasks = 2
+    batch_tasks = 20
     tasks_running = []
     dst_  = ''
-    while len(tasks) > 0:
-        if len(tasks_running) <  max_tasks:
-            ct_batch = 0
-            while ct_batch < batch_tasks:
-                task = tasks.pop()
-                task.start()
-                tasks_running.append(task)
-                print(f'Submiting ... task {ct_}: {task.id}')
-                ct_ += 1
-                ct_batch += 1
+    ct_ = 0
+    total_tasks = len(tasks)
+    # Run loop until all tasks are complete or failed
+    while tasks or tasks_running:
+        # If there are tasks left to run and the number of tasks running is less than the maximum allowed
+        if (len(tasks) > 0) and (len(tasks_running) < max_tasks):
+            # Add a batch of tasks to the list of running tasks
+            for i in range(batch_tasks):
+                # Pop next task from tasks list and start it
+                try:
+                    task = tasks.pop()
+                    task.start()
+                    tasks_running.append(task)
+                    print_with_logging(f'Submiting ... task {ct_start}: {task.id}')
+                    ct_start += 1
+                except:
+                    print_with_logging(f'COMPLETE: All tasks set to run at {datetime.datetime.now()}')
+                    break
 
-        for pos, taskr in enumerate(tasks_running):
+        # Iterate through running tasks and check their status
+        for pos, task_check in enumerate(tasks_running):
             # Check the status of the task
-            status = taskr.status()
+            status = task_check.status()
             # If the task is complete
             if status['state'] == 'COMPLETED':
-                # Print the name of the task
+                # Print the name of the task and remove it from the running tasks list
                 tasks_running.pop(pos)
-                print(f'Completed: {status["id"]}, {ct_done}/{ct_start}')
+                print_with_logging(f'Completed: {status["id"]}, {ct_done + 1}/{total_tasks}')
                 dst_ = status['destination_uris'][0]
                 ct_done += 1
             elif status['state'] == 'FAILED':
-                # Print the name of the task
+                # Print the name of the task and remove it from the running tasks list
                 tasks_running.pop(pos)
-                print(f'Failed: {status["id"]}, {ct_done}/{ct_start}')
-                print(f'Failed: {status["error_message"]}')
+                print_with_logging(f'Failed: {status["id"]}, {ct_done + 1}/{total_tasks}')
+                print_with_logging(f'Failed: {status["error_message"]}')
                 ct_done += 1
-        print(dst_)
-        if ct_done > dry_run:
-            break
+        ct_ += 1
+        if ct_%10 == 0:
+            print_with_logging(dst_)
 
+def write_chips_fromPath(tif_path):
+    init_credentials()
+    config = load_configs()
+
+    # Create a list of tasks
+    # get a list of patch polygons from the dataset
+    tif_path = pathlib.Path(tif_path)
+    poly_path = pathlib.Path(__file__).parent / 'dat' /  f'{tif_path.name}.shp'
+    try:
+        poly_list = gpd.read_file(poly_path.as_posix())
+    except:
+        poly_list = get_poly_list(tif_path)
+        poly_list.to_file(poly_path.as_posix(), driver='ESRI Shapefile')
+    
+    def get_file_prefix(row):
+        return f"lc_glob_2017_{row['roi']}_{row['scene']}_{row['patch']}"
+    poly_list['file_prefix']  = poly_list.apply(get_file_prefix, axis=1)
+
+    write_poly_chips(poly_list)
+
+
+def main():
+    
+    
+    #DEF_PATH = '/media/nsteiner/data1/sen12ms/ROIs1868_summer_s1'
+
+    #write_chips_fromPath(args.path)
+    write_chips_fromPath('/media/nsteiner/data1/sen12ms/TESTING')
+
+    #write_chips_fromPath('/media/nsteiner/data1/sen12ms/ROIs1868_summer_s1')
+    #write_chips_fromPath('/media/nsteiner/data1/sen12ms/ROIs1158_spring')
+    #write_chips_fromPath('/media/nsteiner/data1/sen12ms/ROIs1970_fall_s1')
+
+DEF_PATH = '/media/nsteiner/data1/sen12ms/ROIs1970_fall_s1'
 
 if __name__ == '__main__':
     # Create the argument parser
@@ -231,11 +296,14 @@ if __name__ == '__main__':
 
     # Add the path argument
     parser.add_argument('-p', '--path', help='Path to the file or directory', default=DEF_PATH)
+    
+    # Add the path argument
+    parser.add_argument('-T', '--test', help='Dry run, process first five', default=False)
 
     # Parse the arguments
     args = parser.parse_args()
 
     # Print the path
-    print(args.path)
+    print_with_logging(args.path)
 
     main()
